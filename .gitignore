@@ -37,5 +37,24 @@
 *.out
 *.app
 
-# debug information files
+# Debug information files
 *.dwo
+
+# Build directories
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+Testing/
+CTestTestfile.cmake
