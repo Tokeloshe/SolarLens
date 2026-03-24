@@ -1,71 +1,135 @@
 #include "solarlens/spacecraft/power_thermal.hpp"
-#include <cmath>
 #include <algorithm>
 
 namespace solarlens {
 
-PowerThermalManager::PowerStatus PowerThermalManager::calculate_power_status(
-    uint32_t mission_days,
-    double distance_au
-) {
-    PowerStatus status{};
+PowerThermalSystem::PowerThermalSystem()
+    : cfg_{}, battery_soc_(0.8) {}
 
-    // RTG output with decay
-    const double years_elapsed = mission_days / 365.0;
-    status.rtg_output_w = rtg.initial_power_w *
-                         std::exp(-rtg.decay_rate_per_year * years_elapsed);
+PowerThermalSystem::PowerThermalSystem(const Config& cfg)
+    : cfg_(cfg), battery_soc_(0.8) {}
 
-    // Solar panels (negligible beyond Jupiter)
-    const double solar_power_w = (distance_au < 10.0) ?
-                                100.0 / (distance_au * distance_au) : 0.0;
+double PowerThermalSystem::rtg_power_at(double mission_elapsed_s) const {
+    // Pu-238 exponential decay: P(t) = P_0 × exp(-λt)
+    // λ = ln(2) / t_half
+    const double t_half_s = cfg_.rtg_half_life_years * 365.25 * 86400.0;
+    const double lambda = 0.693147 / t_half_s;
+    return cfg_.rtg_initial_power_w * std::exp(-lambda * mission_elapsed_s);
+}
 
-    // Total available power
-    status.available_power_w = status.rtg_output_w + solar_power_w;
+double PowerThermalSystem::solar_power_at(double distance_au, double mission_elapsed_s) const {
+    // Solar irradiance: 1361 W/m² at 1 AU, scales as 1/r²
+    // Negligible beyond ~5 AU
+    if (distance_au > 10.0) return 0.0;
 
-    // Power consumption budget
-    const double comm_power = 3.0;      // Communications
-    const double compute_power = 2.0;   // Processing
-    const double sensors_power = 2.0;   // Instruments
-    const double thermal_power = 1.0;   // Heaters
-    const double attitude_power = 1.0;  // Reaction wheels
+    const double irradiance = 1361.0 / (distance_au * distance_au);
+    const double years = mission_elapsed_s / (365.25 * 86400.0);
+    const double degradation = std::pow(1.0 - cfg_.panel_degradation_per_year, years);
 
-    status.power_consumption_w = comm_power + compute_power + sensors_power +
-                                thermal_power + attitude_power;
+    return irradiance * cfg_.solar_panel_area_m2 * cfg_.solar_cell_eff * degradation;
+}
 
-    // Battery state
-    if (status.available_power_w > status.power_consumption_w) {
-        // Charging
-        const double charge_rate = status.available_power_w - status.power_consumption_w;
-        battery.current_soc += (charge_rate * battery.charge_efficiency) / battery.capacity_wh;
-        battery.current_soc = std::min(battery.current_soc, 1.0);
+double PowerThermalSystem::compute_temperature(double distance_au, double internal_heat_w) const {
+    // Radiative equilibrium: absorbed power = emitted power
+    //
+    // Absorbed: Q_solar + Q_internal
+    // Q_solar = α × S(r) × A_cross (solar absorptivity × irradiance × cross-section)
+    //   where A_cross ≈ A_surface / 6 for a cube
+    // Q_internal = RTG waste heat + electronics dissipation
+    //
+    // Emitted: ε σ A T⁴
+
+    const double solar_irradiance = 1361.0 / (distance_au * distance_au);  // W/m²
+    const double cross_section = cfg_.spacecraft_surface_area_m2 / 6.0;
+
+    const double q_solar = cfg_.absorptivity * solar_irradiance * cross_section;
+    const double q_total = q_solar + internal_heat_w;
+
+    // T = (Q / (ε σ A))^(1/4)
+    const double t4 = q_total / (cfg_.emissivity * constants::SIGMA_SB * cfg_.spacecraft_surface_area_m2);
+    if (t4 <= 0) return 2.7;  // CMB temperature minimum
+    return std::pow(t4, 0.25);
+}
+
+void PowerThermalSystem::update_battery(double dt_s, double power_surplus_w) {
+    // power_surplus_w > 0 means charging, < 0 means discharging
+    if (power_surplus_w > 0) {
+        double energy_in = power_surplus_w * dt_s / 3600.0;  // Wh
+        battery_soc_ += (energy_in * cfg_.charge_efficiency) / cfg_.battery_capacity_wh;
+        battery_soc_ = std::min(battery_soc_, cfg_.max_soc);
     } else {
-        // Discharging
-        const double discharge_rate = status.power_consumption_w - status.available_power_w;
-        battery.current_soc -= discharge_rate / (battery.capacity_wh * battery.discharge_efficiency);
-        battery.current_soc = std::max(battery.current_soc, 0.0);
+        double energy_out = -power_surplus_w * dt_s / 3600.0;
+        battery_soc_ -= energy_out / (cfg_.battery_capacity_wh * cfg_.discharge_efficiency);
+        battery_soc_ = std::max(battery_soc_, 0.0);
+    }
+}
+
+PowerThermalSystem::SystemStatus PowerThermalSystem::compute_status(
+    double mission_elapsed_s,
+    double distance_au,
+    bool is_thrusting,
+    bool camera_active
+) {
+    SystemStatus status{};
+
+    // Power generation
+    status.rtg_power_w = rtg_power_at(mission_elapsed_s);
+    status.solar_power_w = solar_power_at(distance_au, mission_elapsed_s);
+    status.total_generation_w = status.rtg_power_w + status.solar_power_w;
+
+    // Power consumption
+    PowerBudget budget;
+    if (is_thrusting) {
+        budget.propulsion_w = 150.0;  // Ion engine power
+    }
+    if (!camera_active) {
+        budget.camera_w = 0.5;  // Standby
     }
 
-    status.battery_soc = battery.current_soc;
-    status.battery_runtime_hours = (battery.current_soc * battery.capacity_wh) /
-                                  status.power_consumption_w;
+    // RTG waste heat (thermal power minus electrical)
+    double rtg_thermal = cfg_.rtg_thermal_w * std::exp(
+        -0.693147 * mission_elapsed_s / (cfg_.rtg_half_life_years * 365.25 * 86400.0));
+    double rtg_waste = rtg_thermal - status.rtg_power_w;
 
-    // Temperature calculation (simplified)
-    const double solar_heating_w = 1361.0 / (distance_au * distance_au);  // Solar constant
-    const double rtg_heating_w = rtg.heat_output_w * (1.0 - rtg.efficiency);
-    const double total_heating_w = solar_heating_w + rtg_heating_w;
+    // Temperature calculation
+    double internal_heat = rtg_waste + cfg_.internal_dissipation_w;
+    status.temperature_k = compute_temperature(distance_au, internal_heat);
 
-    // Radiative cooling (Stefan-Boltzmann)
-    const double surface_area_m2 = 0.1;  // CubeSat surface
-    const double emissivity = 0.9;
-    const double sigma = 5.67e-8;
+    // Heater power needed if below operational minimum
+    status.heaters_active = false;
+    status.heater_power_needed_w = 0;
+    if (status.temperature_k < cfg_.t_min_operational_k) {
+        // Need to add heat to reach minimum operational temperature
+        // ΔQ = ε σ A (T_target⁴ - T_current⁴)
+        double t_target4 = std::pow(cfg_.t_min_operational_k, 4.0);
+        double t_current4 = std::pow(status.temperature_k, 4.0);
+        status.heater_power_needed_w = cfg_.emissivity * constants::SIGMA_SB *
+                                       cfg_.spacecraft_surface_area_m2 * (t_target4 - t_current4);
+        status.heater_power_needed_w = std::min(status.heater_power_needed_w, cfg_.heater_power_w);
+        status.heaters_active = true;
+        status.temperature_k = cfg_.t_min_operational_k;  // Heaters maintain minimum
+    }
+    budget.heater_w = status.heater_power_needed_w;
 
-    // Equilibrium temperature
-    status.temperature_k = std::pow(total_heating_w /
-                                   (emissivity * sigma * surface_area_m2), 0.25);
+    status.total_consumption_w = budget.total();
+    status.power_margin_w = status.total_generation_w - status.total_consumption_w;
 
-    // Power modes
-    status.low_power_mode = status.battery_soc < 0.3;
-    status.critical_power = status.battery_soc < 0.1;
+    // Battery state
+    status.battery_soc = battery_soc_;
+    if (status.total_consumption_w > 0) {
+        status.battery_runtime_hours = (battery_soc_ * cfg_.battery_capacity_wh) /
+                                       status.total_consumption_w;
+    }
+
+    // Status flags
+    status.low_power_warning = battery_soc_ < 0.30;
+    status.critical_power = battery_soc_ < 0.15;
+    status.thermal_warning = (status.temperature_k < cfg_.t_min_operational_k ||
+                              status.temperature_k > cfg_.t_max_operational_k);
+    status.thermal_critical = (status.temperature_k < cfg_.t_min_survival_k ||
+                               status.temperature_k > cfg_.t_max_survival_k);
+    status.nominal = !status.low_power_warning && !status.thermal_warning &&
+                     status.power_margin_w > 0;
 
     return status;
 }

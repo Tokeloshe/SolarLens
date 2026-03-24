@@ -21,6 +21,8 @@ include_directories(
 set(SOURCES
     src/main.cpp
     src/gravitational_lens.cpp
+    src/orbital_mechanics.cpp
+    src/interferometry.cpp
     src/exoplanet_detector.cpp
     src/formation_control.cpp
     src/navigation.cpp
@@ -33,6 +35,21 @@ add_executable(solarlens ${SOURCES})
 
 # Math library
 target_link_libraries(solarlens m)
+
+# Test executable
+add_executable(solarlens_tests tests/test_solarlens.cpp
+    src/gravitational_lens.cpp
+    src/orbital_mechanics.cpp
+    src/interferometry.cpp
+    src/exoplanet_detector.cpp
+    src/formation_control.cpp
+    src/navigation.cpp
+    src/deep_space_relay.cpp
+    src/power_thermal.cpp
+)
+target_link_libraries(solarlens_tests m)
+enable_testing()
+add_test(NAME solarlens_tests COMMAND solarlens_tests)
 
 # Installation
 install(TARGETS solarlens DESTINATION bin)

@@ -1,4 +1,6 @@
 #include "solarlens/physics/gravitational_lens.hpp"
+#include "solarlens/physics/orbital_mechanics.hpp"
+#include "solarlens/physics/interferometry.hpp"
 #include "solarlens/imaging/exoplanet_detector.hpp"
 #include "solarlens/spacecraft/formation_control.hpp"
 #include "solarlens/spacecraft/navigation.hpp"
@@ -7,21 +9,24 @@
 
 #include <iostream>
 #include <iomanip>
-#include <unistd.h>
+#include <cstring>
 
 namespace solarlens {
 
 // ============================================================================
 // MAIN MISSION CONTROLLER
+//
+// 6-phase state machine controlling a Starlink-scale CubeSat swarm
+// at the solar gravitational lens focal region (~650 AU).
 // ============================================================================
 class SolarLensMission {
 private:
-    GravitationalLensPhysics physics;
-    // ExoplanetDetector detector; // Commented out due to large stack arrays (8MB+)
-    SwarmController swarm;
-    DeepSpaceNavigator navigator;
-    InterstellarTransmitter transmitter;
-    PowerThermalManager power;
+    GravitationalLens sgl_;
+    SwarmFormation swarm_;
+    PulsarNavigator navigator_;
+    PowerThermalSystem power_;
+    DeepSpaceComms::RSCodec rs_codec_;
+    ExoplanetDetector detector_;
 
     enum class Phase : uint8_t {
         LAUNCH,
@@ -30,190 +35,290 @@ private:
         FORMATION,
         OBSERVATION,
         TRANSMISSION
-    } current_phase;
+    } current_phase_;
 
-    uint64_t mission_time_ms;
-    uint32_t cycle_count;
+    uint64_t mission_time_ms_;
+    uint32_t cycle_count_;
 
 public:
-    SolarLensMission() : current_phase(Phase::LAUNCH), mission_time_ms(0), cycle_count(0) {
-        // Initialize swarm with 16 spacecraft
-        swarm.set_active_count(16);
+    SolarLensMission()
+        : current_phase_(Phase::LAUNCH)
+        , mission_time_ms_(0)
+        , cycle_count_(0)
+    {
+        // Initialize swarm with 16 spacecraft for demo
+        swarm_.set_swarm_size(16);
     }
 
-    // Main control loop - runs at 10 Hz
     void execute() {
-        // Update mission time
-        mission_time_ms += 100;  // 100ms per cycle at 10Hz
-        cycle_count++;
+        mission_time_ms_ += 100000;  // Accelerated: 100s per cycle for demo
+        cycle_count_++;
 
-        // Print status every 10 seconds (100 cycles)
-        if (cycle_count % 100 == 0) {
+        // Print status periodically
+        if (cycle_count_ % 50 == 0 && cycle_count_ > 0) {
             print_status();
         }
 
-        // Get current state
-        const auto nav_solution = navigator.calculate_position(nullptr, mission_time_ms * 1000000);
-        const auto power_status = power.calculate_power_status(mission_time_ms / 86400000,
-                                                              nav_solution.position_au[0]);
+        // Use nominal distance (full XNAV only in observation phase)
+        double distance_au = constants::SGL_FOCAL_NOMINAL_AU;
 
-        // Suppress unused variable warning (used for monitoring in real mission)
-        (void)power_status;
-
-        // Phase-specific operations
-        switch (current_phase) {
+        switch (current_phase_) {
             case Phase::LAUNCH:
-                if (mission_time_ms > 3600000) {  // 1 hour
+                if (cycle_count_ > 20) {  // After 20 cycles
                     std::cout << "\n=== TRANSITION TO CRUISE PHASE ===\n";
-                    current_phase = Phase::CRUISE;
+                    current_phase_ = Phase::CRUISE;
                 }
                 break;
 
             case Phase::CRUISE:
-                // 25-year journey (simulated - would take actual years)
-                if (nav_solution.position_au[0] > constants::FOCAL_OPTIMAL_AU - 1.0) {
-                    std::cout << "\n=== ARRIVAL AT FOCAL POINT ===\n";
-                    current_phase = Phase::ARRIVAL;
+                // Demonstrate trajectory planning
+                if (cycle_count_ == 200) {
+                    std::cout << "\n--- Trajectory Analysis ---\n";
+                    auto plan = OrbitalMechanics::plan_sgl_mission(
+                        constants::SGL_FOCAL_NOMINAL_AU, true, true
+                    );
+                    std::cout << "Earth departure Δv: "
+                              << std::fixed << std::setprecision(2)
+                              << plan.dv_earth_departure / 1000.0 << " km/s\n";
+                    std::cout << "Jupiter assist Δv gained: "
+                              << plan.dv_jupiter_assist / 1000.0 << " km/s\n";
+                    std::cout << "Total Δv: " << plan.dv_total / 1000.0 << " km/s\n";
+                    std::cout << "Cruise time: " << plan.cruise_time_years << " years\n";
+                    std::cout << "Arrival speed: " << plan.arrival_speed_km_s << " km/s\n";
+                }
+                if (cycle_count_ > 80) {
+                    std::cout << "\n=== ARRIVAL AT FOCAL REGION (" << distance_au << " AU) ===\n";
+                    current_phase_ = Phase::ARRIVAL;
                 }
                 break;
 
             case Phase::ARRIVAL:
-                // Slow down and prepare for formation
-                if (nav_solution.velocity_km_s[0] < 1.0) {
-                    std::cout << "\n=== BEGINNING FORMATION ===\n";
-                    current_phase = Phase::FORMATION;
-                }
+                std::cout << "\n=== DEPLOYING FORMATION ===\n";
+                current_phase_ = Phase::FORMATION;
                 break;
 
             case Phase::FORMATION: {
-                // Form observation array
-                double target[3] = {650.0, 0.0, 0.0};
-                if (swarm.optimize_formation(
-                    SwarmController::Formation::HEXAGONAL_GRID,
-                    target,
-                    1000.0  // 1000 km baseline
-                )) {
+                Vec3 target_dir{1.0, 0.0, 0.0};  // Toward Alpha Centauri
+                bool deployed = swarm_.deploy_formation(
+                    SwarmFormation::Geometry::HEXAGONAL_GRID,
+                    target_dir,
+                    50000.0  // 50 km baseline
+                );
+                if (deployed) {
+                    std::cout << "Formation deployed: " << swarm_.get_swarm_size()
+                              << " satellites\n";
+                    std::cout << "Max baseline: " << std::scientific
+                              << swarm_.max_baseline() << " m\n";
+                    std::cout << "Formation error RMS: " << std::fixed << std::setprecision(3)
+                              << swarm_.formation_error_rms() << " m\n";
+                    std::cout << "Health fraction: " << std::setprecision(1)
+                              << swarm_.health_fraction() * 100.0 << "%\n";
+
                     std::cout << "\n=== FORMATION COMPLETE - STARTING OBSERVATION ===\n";
-                    current_phase = Phase::OBSERVATION;
+                    current_phase_ = Phase::OBSERVATION;
                 }
                 break;
             }
 
             case Phase::OBSERVATION: {
-                // Simulated exoplanet detection (every 10 seconds in demo)
-                if (cycle_count % 100 == 0 && cycle_count > 100) {
-                    std::cout << "\n--- EXOPLANET DETECTION SIMULATION ---\n";
-                    std::cout << "Performing gravitational lens imaging...\n";
-                    std::cout << "Integration time: 3600 seconds\n";
-                    std::cout << "Target: Alpha Centauri system (4.37 ly)\n";
-                    std::cout << "Wavelength: 550 nm (visible light)\n";
-
-                    // Calculate magnification for demo
-                    double mag = physics.calculate_magnification(4.37, 650.0, 5000.0);
-                    std::cout << "Achieved magnification: " << std::scientific
-                              << std::setprecision(2) << mag << "\n";
-
-                    // Simulate detection after 30 seconds of observation
-                    if (cycle_count > 300) {
-                        std::cout << "\n!!! EXOPLANET CANDIDATE DETECTED !!!\n";
-                        std::cout << "Estimated radius: 1.05 Earth radii\n";
-                        std::cout << "Orbital radius: 1.2 AU (habitable zone)\n";
-                        std::cout << "Atmospheric signatures detected (O2, H2O)\n";
-                        std::cout << "Biosignature score: 0.6 (moderate)\n";
-                        std::cout << "\nPreparing to transmit discovery...\n";
-                        current_phase = Phase::TRANSMISSION;
-                    }
+                if (cycle_count_ % 50 == 0 && cycle_count_ > 100) {
+                    run_observation_cycle(distance_au);
                 }
                 break;
             }
 
             case Phase::TRANSMISSION: {
-                // Send discovery back to Earth
-                const uint8_t message[] = "LIFE DETECTED";
-                const auto encoded = transmitter.encode_message(
-                    message,
-                    sizeof(message),
-                    InterstellarTransmitter::ErrorCorrection::TURBO_CODES
-                );
-
-                // Suppress unused variable warning (would be transmitted in real mission)
-                (void)encoded;
-
-                // Calculate link budget
-                const auto link = transmitter.calculate_link_budget(
-                    0.0,    // Earth distance
-                    1e9,    // Lens magnification
-                    true    // Use lens
-                );
-
-                print_link_budget(link);
-
-                if (link.link_margin_db > 0) {
-                    std::cout << "=== TRANSMISSION SUCCESSFUL ===\n";
-                    std::cout << "Returning to observation mode...\n";
-                    current_phase = Phase::OBSERVATION;
-                }
+                run_transmission_cycle(distance_au);
                 break;
             }
         }
     }
 
-    void print_status() {
-        std::cout << "\n--- Mission Time: " << (mission_time_ms / 1000.0) << "s ---\n";
-        std::cout << "Phase: " << get_phase_name(current_phase) << "\n";
+private:
+    void run_observation_cycle(double distance_au) {
+        std::cout << "\n--- EXOPLANET OBSERVATION CYCLE ---\n";
+        std::cout << "Target: Alpha Centauri system (4.37 ly)\n";
+        std::cout << "Observer distance: " << std::fixed << std::setprecision(1)
+                  << distance_au << " AU\n";
 
-        // Calculate and display focal distance for visible light
-        const double focal_dist = physics.calculate_focal_distance_au(550.0);
-        std::cout << "Optimal Focal Distance (550nm): " << std::fixed << std::setprecision(1)
+        // SGL physics
+        const double wavelength_nm = 550.0;
+        double gain = sgl_.peak_amplification(wavelength_nm);
+        double focal_dist = sgl_.focal_distance_au(wavelength_nm);
+        double einstein_r = sgl_.einstein_ring_radius_m(distance_au);
+
+        std::cout << "Wavelength: " << wavelength_nm << " nm\n";
+        std::cout << "SGL peak amplification: " << std::scientific << std::setprecision(3)
+                  << gain << "\n";
+        std::cout << "Focal distance: " << std::fixed << std::setprecision(1)
                   << focal_dist << " AU\n";
+        std::cout << "Einstein ring radius: " << std::setprecision(1) << einstein_r << " m\n";
 
-        // Display magnification at Einstein ring
-        const double mag = physics.calculate_magnification(10.0, 650.0, 5000.0);
-        std::cout << "Magnification: " << std::scientific << std::setprecision(2) << mag << "\n";
+        // SNR calculation
+        double planet_flux = 1e-4;  // photons/m²/s at 1 AU for Earth twin at 4.37 ly
+        auto snr = sgl_.compute_snr(
+            planet_flux, wavelength_nm, distance_au,
+            constants::SAT_APERTURE_M,
+            swarm_.get_swarm_size(),
+            3600.0  // 1 hour integration
+        );
+
+        std::cout << "\nSNR Analysis (1 hour integration, " << swarm_.get_swarm_size() << " sats):\n";
+        std::cout << "  Signal photons: " << std::scientific << std::setprecision(2)
+                  << snr.signal_photons << "\n";
+        std::cout << "  Corona photons: " << snr.corona_photons << "\n";
+        std::cout << "  SNR: " << std::fixed << std::setprecision(1) << snr.snr << "\n";
+
+        // Generate synthetic planet data for demonstration
+        if (snr.snr > 5.0 || cycle_count_ > 100) {
+            std::cout << "\n*** EXOPLANET CANDIDATE DETECTED ***\n";
+
+            // Generate synthetic Earth spectrum and image for pipeline demo
+            auto spectrum = ExoplanetDetector::generate_earth_spectrum(
+                ExoplanetDetector::SPECTRUM_BINS, 4.37);
+            auto planet_img = ExoplanetDetector::generate_planet_image(64, 8.0, 0.3, true);
+
+            // Run full analysis pipeline
+            auto planet = detector_.analyze(
+                planet_img, 64, 1e-9,
+                spectrum, 1.0, 4.37, distance_au
+            );
+
+            if (planet.detected) {
+                print_planet_data(planet);
+                std::cout << "\nPreparing to transmit discovery...\n";
+                current_phase_ = Phase::TRANSMISSION;
+            }
+        }
+    }
+
+    void run_transmission_cycle(double distance_au) {
+        std::cout << "\n--- TRANSMITTING DISCOVERY ---\n";
+
+        // Encode message with Reed-Solomon
+        const char* msg = "EXOPLANET BIOSIGNATURE DETECTED - ALPHA CENTAURI";
+        uint8_t message[DeepSpaceComms::RS_K] = {};
+        std::memcpy(message, msg, std::min(std::strlen(msg), static_cast<size_t>(DeepSpaceComms::RS_K)));
+
+        uint8_t codeword[DeepSpaceComms::RS_N] = {};
+        rs_codec_.encode(message, codeword);
+
+        std::cout << "RS(" << DeepSpaceComms::RS_N << "," << DeepSpaceComms::RS_K
+                  << ") encoded: " << std::strlen(msg) << " bytes -> "
+                  << DeepSpaceComms::RS_N << " bytes\n";
+
+        // Simulate errors and correction
+        codeword[10] ^= 0xFF;
+        codeword[50] ^= 0xAB;
+        codeword[100] ^= 0x55;
+        int corrected = rs_codec_.decode(codeword);
+        std::cout << "Simulated 3 symbol errors, corrected: " << corrected << "\n";
+
+        // Link budget: satellite to Earth via DSN
+        auto link_dsn = DeepSpaceComms::satellite_to_earth_link(distance_au);
+        print_link_budget("Direct Ka-band to DSN", link_dsn);
+
+        // Link budget: SGL-amplified (using Sun as antenna for return signal)
+        auto link_sgl = DeepSpaceComms::sgl_amplified_link(4.37, 550.0);
+        print_link_budget("SGL-amplified optical", link_sgl);
+
+        // Relay chain
+        auto relay = DeepSpaceComms::plan_relay_chain(distance_au, 5, 10.0);
+        std::cout << "\nRelay Chain (" << relay.nodes.size() << " nodes):\n";
+        std::cout << "  End-to-end rate: " << std::scientific << std::setprecision(2)
+                  << relay.end_to_end_rate_bps << " bps\n";
+        std::cout << "  End-to-end latency: " << std::fixed << std::setprecision(1)
+                  << relay.end_to_end_latency_s / 3600.0 << " hours\n";
+        std::cout << "  Total power: " << relay.total_power_w << " W\n";
+
+        if (link_dsn.link_margin_db > 0 || relay.end_to_end_rate_bps > 0) {
+            std::cout << "\n=== TRANSMISSION SUCCESSFUL ===\n";
+            std::cout << "Returning to observation mode...\n\n";
+            current_phase_ = Phase::OBSERVATION;
+        }
+    }
+
+    void print_status() {
+        std::cout << "\n--- Mission Time: " << std::fixed << std::setprecision(1)
+                  << (mission_time_ms_ / 1000.0) << "s | Phase: "
+                  << get_phase_name() << " ---\n";
+
+        // SGL physics summary
+        const double focal_dist = sgl_.focal_distance_au(550.0);
+        const double gain = sgl_.peak_amplification(550.0);
+        std::cout << "SGL focal distance (550nm): " << std::fixed << std::setprecision(1)
+                  << focal_dist << " AU | Peak gain: " << std::scientific << std::setprecision(2)
+                  << gain << "\n";
+
+        // Navigation
+        std::cout << "XNAV pulsars: " << PulsarNavigator::NUM_PULSARS
+                  << " | GDOP: " << std::fixed << std::setprecision(2)
+                  << navigator_.compute_gdop(Vec3{constants::SGL_FOCAL_NOMINAL_AU, 0, 0}) << "\n";
+
+        // Power at 650 AU
+        auto pwr = power_.compute_status(mission_time_ms_ / 1000.0,
+                                         constants::SGL_FOCAL_NOMINAL_AU,
+                                         false, true);
+        std::cout << "Power: RTG " << std::fixed << std::setprecision(1)
+                  << pwr.rtg_power_w << "W + Solar " << pwr.solar_power_w
+                  << "W | Temp: " << pwr.temperature_k << "K"
+                  << (pwr.heaters_active ? " [HEATERS ON]" : "") << "\n";
     }
 
     void print_planet_data(const ExoplanetDetector::PlanetData& planet) {
-        std::cout << "\n*** EXOPLANET DETECTED ***\n";
-        std::cout << "Radius: " << std::fixed << std::setprecision(2)
+        std::cout << "\nPlanet Characterization:\n";
+        std::cout << "  Radius: " << std::fixed << std::setprecision(2)
                   << planet.radius_earth << " Earth radii\n";
-        std::cout << "Temperature: " << std::setprecision(0)
-                  << planet.temperature_kelvin << " K\n";
-        std::cout << "Orbital Radius: " << std::setprecision(2)
+        std::cout << "  Mass: " << planet.mass_earth << " Earth masses\n";
+        std::cout << "  Temperature: " << std::setprecision(0)
+                  << planet.temperature_k << " K\n";
+        std::cout << "  Albedo: " << std::setprecision(2) << planet.albedo << "\n";
+        std::cout << "  Surface gravity: " << std::setprecision(1)
+                  << planet.surface_gravity << " m/s²\n";
+        std::cout << "  Orbital radius: " << std::setprecision(2)
                   << planet.orbital_radius_au << " AU\n";
-        std::cout << "Habitable Zone: " << (planet.in_habitable_zone ? "YES" : "NO") << "\n";
-        std::cout << "Confidence: " << std::setprecision(1)
+        std::cout << "  Orbital period: " << std::setprecision(1)
+                  << planet.orbital_period_days << " days\n";
+        std::cout << "  Habitable zone: " << (planet.in_habitable_zone ? "YES" : "NO") << "\n";
+        std::cout << "  Confidence: " << std::setprecision(1)
                   << planet.confidence * 100.0f << "%\n";
-        std::cout << "\nAtmospheric Composition:\n";
-        std::cout << "  O2:  " << planet.atmosphere.oxygen << "%\n";
-        std::cout << "  CH4: " << planet.atmosphere.methane << "%\n";
-        std::cout << "  H2O: " << planet.atmosphere.water << "%\n";
-        std::cout << "  CO2: " << planet.atmosphere.co2 << "%\n";
-        std::cout << "  N2:  " << planet.atmosphere.nitrogen << "%\n";
+
+        std::cout << "\nAtmospheric Composition (volume mixing ratios):\n";
+        std::cout << "  N2:  " << std::setprecision(3) << planet.atmosphere.n2 << "\n";
+        std::cout << "  O2:  " << planet.atmosphere.o2 << "\n";
+        std::cout << "  CO2: " << planet.atmosphere.co2 << "\n";
+        std::cout << "  H2O: " << planet.atmosphere.h2o << "\n";
+        std::cout << "  CH4: " << planet.atmosphere.ch4 << "\n";
+        std::cout << "  O3:  " << planet.atmosphere.o3 << "\n";
+
         std::cout << "\nBiosignature Score: " << std::setprecision(1)
-                  << planet.atmosphere.biosignature_score * 100.0f << "%\n";
+                  << planet.atmosphere.biosignature_score * 100.0 << "%\n";
+        std::cout << "Assessment: " << planet.atmosphere.biosignature_rationale << "\n";
     }
 
-    void print_link_budget(const InterstellarTransmitter::LinkBudget& link) {
-        std::cout << "\n--- Communication Link Budget ---\n";
-        std::cout << "Frequency: " << link.frequency_ghz << " GHz\n";
-        std::cout << "TX Power: " << link.tx_power_watts << " W\n";
-        std::cout << "Path Loss: " << std::fixed << std::setprecision(1)
-                  << link.path_loss_db << " dB\n";
-        std::cout << "Data Rate: " << std::scientific << std::setprecision(2)
-                  << link.data_rate_bps << " bps\n";
-        std::cout << "Link Margin: " << std::fixed << std::setprecision(1)
+    void print_link_budget(const char* label, const DeepSpaceComms::LinkBudget& link) {
+        std::cout << "\n" << label << " Link Budget:\n";
+        std::cout << "  Frequency: " << std::scientific << std::setprecision(2)
+                  << link.frequency_hz << " Hz\n";
+        std::cout << "  TX Power: " << std::fixed << std::setprecision(1)
+                  << link.tx_power_w << " W\n";
+        std::cout << "  Path Loss: " << link.free_space_loss_db << " dB\n";
+        std::cout << "  SNR: " << link.snr_db << " dB\n";
+        std::cout << "  Achievable Rate: " << std::scientific << std::setprecision(2)
+                  << link.achievable_rate_bps << " bps\n";
+        std::cout << "  Link Margin: " << std::fixed << std::setprecision(1)
                   << link.link_margin_db << " dB\n";
     }
 
-    const char* get_phase_name(Phase phase) {
-        switch (phase) {
-            case Phase::LAUNCH: return "LAUNCH";
-            case Phase::CRUISE: return "CRUISE";
-            case Phase::ARRIVAL: return "ARRIVAL";
-            case Phase::FORMATION: return "FORMATION";
-            case Phase::OBSERVATION: return "OBSERVATION";
+    const char* get_phase_name() const {
+        switch (current_phase_) {
+            case Phase::LAUNCH:       return "LAUNCH";
+            case Phase::CRUISE:       return "CRUISE";
+            case Phase::ARRIVAL:      return "ARRIVAL";
+            case Phase::FORMATION:    return "FORMATION";
+            case Phase::OBSERVATION:  return "OBSERVATION";
             case Phase::TRANSMISSION: return "TRANSMISSION";
-            default: return "UNKNOWN";
+            default:                  return "UNKNOWN";
         }
     }
 };
@@ -225,23 +330,26 @@ public:
 // ============================================================================
 int main() {
     std::cout << "==================================================\n";
-    std::cout << "  SOLARLENS - Solar Gravitational Lens Mission\n";
-    std::cout << "  Flight-Ready CubeSat Swarm Control System\n";
+    std::cout << "  SOLARLENS — Solar Gravitational Lens Mission\n";
+    std::cout << "  Starlink-Scale CubeSat Swarm Control System\n";
     std::cout << "==================================================\n\n";
-    std::cout.flush();
+
+    // Print key SGL parameters
+    std::cout << "Physical Constants:\n";
+    std::cout << "  Schwarzschild radius: " << std::fixed << std::setprecision(2)
+              << solarlens::constants::R_SCHWARZSCHILD << " m\n";
+    std::cout << "  SGL focal minimum: " << std::setprecision(1)
+              << solarlens::constants::SGL_FOCAL_MIN_AU << " AU\n";
+    std::cout << "  SGL nominal distance: "
+              << solarlens::constants::SGL_FOCAL_NOMINAL_AU << " AU\n\n";
 
     solarlens::SolarLensMission mission;
 
-    std::cout << "Mission initialized. Running control loop...\n";
-    std::cout << "(Running for 50 cycles demonstration)\n\n";
+    std::cout << "Mission initialized. Running control loop (500 cycles)...\n\n";
     std::cout.flush();
 
-    // Run for 50 cycles (5 seconds at 10Hz simulated)
     for (int i = 0; i < 500; ++i) {
         mission.execute();
-
-        // Reduced sleep for faster demo
-        usleep(10000);  // 10ms instead of 100ms
     }
 
     std::cout << "\n==================================================\n";
